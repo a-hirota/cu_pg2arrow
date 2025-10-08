@@ -1,6 +1,13 @@
 Makefile.custom
 *.so
 *.o
+*.bc
+*.bc.tmp
 *.fatbin
 *.gfatbin
+*.deb
+githash.c
+gpu_devattrs.h
+flatbuffers_v21_backup/
+CLAUDE.md
 

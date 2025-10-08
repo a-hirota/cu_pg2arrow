@@ -929,6 +929,10 @@ parquetReadOneRowGroup(const char *filename,
 												size_t malloc_size),
 					   void *malloc_private,
 					   const char **p_error_message);
+
+/* GPU decompression control variable */
+__EXTERN bool arrow_fdw_gpu_decompression_enabled;
+
 #undef __EXTERN
 
 #endif		/* !__CUDACC__ */

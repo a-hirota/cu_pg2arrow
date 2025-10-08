@@ -10,10 +10,11 @@ STROM_OBJS = main.o githash.o extra.o codegen.o executor.o fallback.o \
              gpu_device.o gpu_service.o dpu_device.o \
              gpu_scan.o gpu_join.o gpu_preagg.o \
              relscan.o brin.o gist.o gpu_cache.o select_into.o \
-             arrow_fdw.o arrow_meta.o parquet_read.o \
+             arrow_fdw.o arrow_meta.o parquet_read.o parquet_gpu_decomp.o \
+             parquet_cudf_loader.o parquet_cudf_read.o \
              misc.o float2.o tinyint.o aggfuncs.o
 GENERATED-HEADERS = gpu_devattrs.h githash.c
-STROM_HEADERS = arrow_defs.h arrow_ipc.h float2.h
+STROM_HEADERS = arrow_defs.h arrow_ipc.h float2.h parquet_gpu_decomp.h parquet_cudf_loader.h
 
 #
 # Githash.c checker
@@ -92,6 +93,16 @@ endif
 endif
 
 #
+# libcudf (RAPIDS) - GPU-native Parquet reading via dynamic loading
+#
+# Note: libpgstrom_cudf.so is built separately in libcudf/ subdirectory
+# and loaded dynamically at runtime via dlopen()
+PGSTROM_FLAGS += -DHAS_LIBCUDF=1
+SHLIB_LINK += -ldl
+# parquet_cudf_read.cpp uses CUDA runtime (cudaMemcpy, etc.)
+SHLIB_LINK += -L/usr/local/cuda/lib64 -lcudart
+
+#
 # Definition of PG-Strom Extension
 #
 MODULE_big = pg_strom
@@ -103,9 +114,9 @@ OBJS = $(STROM_OBJS)
 EXTRA_CLEAN = $(CUDA_OBJS) $(GENERATED-HEADERS) \
               $(shell ls -d pgstrom-gpucode-V*-*.fatbin 2>/dev/null)
 EXTENSION = pg_strom
-PG_CPPFLAGS := $(PGSTROM_FLAGS) -I $(CUDA_IPATH)
+PG_CPPFLAGS := $(PGSTROM_FLAGS) -I $(CUDA_IPATH) -I /usr/include/nvcomp_12
 PG_CXXFLAGS := -std=c++17 -Wno-sign-compare
-SHLIB_LINK += -L $(CUDA_LPATH) -lcuda
+SHLIB_LINK += -L $(CUDA_LPATH) -lcuda -L /usr/lib/x86_64-linux-gnu/nvcomp/12 -lnvcomp
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

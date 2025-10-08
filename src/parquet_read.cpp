@@ -23,8 +23,20 @@
 #include <sys/time.h>
 #include <thread>
 #include <unistd.h>
+#include <cuda_runtime.h>
 #include "xpu_common.h"
 #include "arrow_defs.h"
+#include "parquet_gpu_decomp.h"
+
+/* Forward declaration for cuDF reader */
+extern "C" kern_data_store *parquetReadRowGroupCuDF(
+	const char *filename,
+	int row_group_index,
+	const std::vector<int> &column_indices,
+	const kern_data_store *kds_head,
+	void *(*malloc_callback)(void *malloc_private, size_t malloc_size),
+	void *malloc_private,
+	const char **p_error_message);
 
 /*
  * Error Reporting
@@ -656,25 +668,252 @@ __parquetReadOneRowGroup(const char *filename,
 			if (cmeta->field_index >= 0)
 				referenced.push_back(cmeta->field_index);
 		}
-		status = parquet_file_reader->ReadRowGroup(row_group_index,
-												   referenced,
-												   &table);
-		if (status.ok())
+
+		/* Try cuDF GPU-native Parquet reading if enabled */
+		bool gpu_reading_successful = false;
+		if (arrow_fdw_gpu_decompression_enabled && !referenced.empty())
 		{
-			kds = parquetReadArrowTable(table, referenced,
-										kds_head,
-										malloc_callback,
-										malloc_private);
+			fprintf(stderr, "[PG-Strom] Attempting cuDF GPU-native Parquet reading for row group %u\n",
+					row_group_index);
+			fflush(stderr);
+
+			const char *cudf_error = nullptr;
+			kds = parquetReadRowGroupCuDF(filename, row_group_index,
+										  referenced, kds_head,
+										  malloc_callback, malloc_private,
+										  &cudf_error);
+			if (kds)
+			{
+				fprintf(stderr, "[PG-Strom] cuDF GPU-native reading completed for row group %u\n", row_group_index);
+				fflush(stderr);
+				gpu_reading_successful = true;
+			}
+			else
+			{
+				fprintf(stderr, "[PG-Strom] cuDF failed: %s, falling back to CPU\n",
+						cudf_error ? cudf_error : "unknown");
+				fflush(stderr);
+			}
 		}
-		else
+
+		/* Fall back to CPU decompression (standard Arrow reader) if cuDF failed */
+		if (!gpu_reading_successful)
 		{
-			__Elog("failed on parquet::arrow::FileReader::ReadRowGroup: %s",
-				   status.ToString().c_str());
+			if (!arrow_fdw_gpu_decompression_enabled)
+			{
+				fprintf(stderr, "INFO: Using CPU decompression (GPU reading disabled)\n");
+			}
+
+			status = parquet_file_reader->ReadRowGroup(row_group_index,
+													   referenced,
+													   &table);
+			if (status.ok())
+			{
+				kds = parquetReadArrowTable(table, referenced,
+											kds_head,
+											malloc_callback,
+											malloc_private);
+			}
+			else
+			{
+				__Elog("failed on parquet::arrow::FileReader::ReadRowGroup: %s",
+					   status.ToString().c_str());
+			}
 		}
 	}
 	parquetPutMetaDataCache(entry);
 	return kds;
 }
+
+/*
+ * OLD GPU decompression code - keeping for reference, can be removed later
+ */
+#if 0
+		/* Try GPU decompression if enabled */
+		bool gpu_decompression_attempted = false;
+		if (arrow_fdw_gpu_decompression_enabled && !referenced.empty())
+		{
+			fprintf(stderr, "INFO: Attempting GPU decompression for row group %u\n",
+					row_group_index);
+
+			/* Check if the columns are compressed */
+			auto rg_metadata = entry->metadata->RowGroup(row_group_index);
+			bool has_compression = false;
+
+			for (size_t i = 0; i < referenced.size(); i++)
+			{
+				int col_idx = referenced[i];
+				if (col_idx < rg_metadata->num_columns())
+				{
+					auto col_meta = rg_metadata->ColumnChunk(col_idx);
+					auto comp_type = col_meta->compression();
+					if (comp_type != parquet::Compression::UNCOMPRESSED)
+					{
+						has_compression = true;
+						fprintf(stderr, "  Column %d: compression=%d\n",
+								col_idx, (int)comp_type);
+					}
+				}
+			}
+
+			if (has_compression)
+			{
+				fprintf(stderr, "  Found compressed columns, attempting GPU decompression...\n");
+
+				/* Prepare column indices for GPU decompression */
+				int *column_indices = new int[referenced.size()];
+				for (size_t i = 0; i < referenced.size(); i++)
+					column_indices[i] = referenced[i];
+
+				/* Get row group metadata for GPU decompression */
+				const char *gpu_error = nullptr;
+				ParquetRowGroupInfo *rg_info = parquetGetRowGroupInfo(
+					filename,
+					row_group_index,
+					column_indices,
+					referenced.size(),
+					&gpu_error);
+
+				if (rg_info)
+				{
+					fprintf(stderr, "  Metadata extracted: %d columns, %ld rows\n",
+							rg_info->num_columns, rg_info->num_rows);
+
+					/* Read compressed data to GPU */
+					void **d_compressed = new void*[rg_info->num_columns];
+					size_t *compressed_sizes = new size_t[rg_info->num_columns];
+
+					int rc = parquetReadCompressedToGPU(filename, rg_info,
+													   d_compressed, compressed_sizes,
+													   &gpu_error);
+					if (rc == 0)
+					{
+						fprintf(stderr, "  Compressed data loaded to GPU\n");
+
+						/* Decompress on GPU */
+						void **d_uncompressed = new void*[rg_info->num_columns];
+						size_t *uncompressed_sizes = new size_t[rg_info->num_columns];
+
+						rc = parquetDecompressOnGPU(rg_info,
+												   d_compressed, compressed_sizes,
+												   d_uncompressed, uncompressed_sizes,
+												   nullptr, /* default CUDA stream */
+												   &gpu_error);
+						if (rc == 0)
+						{
+							fprintf(stderr, "  GPU decompression successful!\n");
+							for (int i = 0; i < rg_info->num_columns; i++)
+							{
+								fprintf(stderr, "    Column %d: %zu -> %zu bytes (%.2fx)\n",
+										i, compressed_sizes[i], uncompressed_sizes[i],
+										(double)uncompressed_sizes[i] / compressed_sizes[i]);
+							}
+
+							/* Copy decompressed data from GPU to CPU for verification */
+							fprintf(stderr, "  Copying decompressed data from GPU to CPU...\n");
+							std::vector<void*> h_uncompressed(rg_info->num_columns);
+							bool copy_success = true;
+
+							for (int i = 0; i < rg_info->num_columns; i++)
+							{
+								h_uncompressed[i] = malloc(uncompressed_sizes[i]);
+								if (!h_uncompressed[i])
+								{
+									fprintf(stderr, "  ERROR: Failed to allocate CPU memory for column %d\n", i);
+									copy_success = false;
+									break;
+								}
+
+								cudaError_t err = cudaMemcpy(h_uncompressed[i],
+															 d_uncompressed[i],
+															 uncompressed_sizes[i],
+															 cudaMemcpyDeviceToHost);
+								if (err != cudaSuccess)
+								{
+									fprintf(stderr, "  ERROR: cudaMemcpy failed for column %d: %s\n",
+											i, cudaGetErrorString(err));
+									copy_success = false;
+									break;
+								}
+							}
+
+							if (copy_success)
+							{
+								fprintf(stderr, "  Successfully copied %d columns to CPU\n", rg_info->num_columns);
+								fprintf(stderr, "  Total decompressed data: ");
+								size_t total = 0;
+								for (int i = 0; i < rg_info->num_columns; i++)
+									total += uncompressed_sizes[i];
+								fprintf(stderr, "%zu bytes\n", total);
+
+								/* TODO: Parse Parquet page structure and build Arrow Table */
+								fprintf(stderr, "  INFO: Parquet page parsing not yet implemented\n");
+								fprintf(stderr, "  Falling back to CPU decompression for Arrow conversion\n");
+							}
+
+							/* Cleanup CPU memory */
+							for (int i = 0; i < rg_info->num_columns; i++)
+							{
+								if (h_uncompressed[i])
+									free(h_uncompressed[i]);
+							}
+
+							/* Cleanup GPU memory */
+							for (int i = 0; i < rg_info->num_columns; i++)
+							{
+								cudaFree(d_compressed[i]);
+								cudaFree(d_uncompressed[i]);
+							}
+
+							gpu_decompression_attempted = false; /* Force CPU fallback for now */
+						}
+						else
+						{
+							fprintf(stderr, "  GPU decompression failed: %s\n",
+									gpu_error ? gpu_error : "unknown");
+							fprintf(stderr, "  Falling back to CPU decompression\n");
+
+							/* Cleanup */
+							for (int i = 0; i < rg_info->num_columns; i++)
+							{
+								if (d_compressed[i])
+									cudaFree(d_compressed[i]);
+							}
+						}
+
+						delete[] d_uncompressed;
+						delete[] uncompressed_sizes;
+					}
+					else
+					{
+						fprintf(stderr, "  Failed to load compressed data: %s\n",
+								gpu_error ? gpu_error : "unknown");
+						fprintf(stderr, "  Falling back to CPU decompression\n");
+					}
+
+					delete[] d_compressed;
+					delete[] compressed_sizes;
+					parquetFreeRowGroupInfo(rg_info);
+				}
+				else
+				{
+					fprintf(stderr, "  Failed to get row group info: %s\n",
+							gpu_error ? gpu_error : "unknown");
+					fprintf(stderr, "  Falling back to CPU decompression\n");
+				}
+
+				delete[] column_indices;
+			}
+			else
+			{
+				fprintf(stderr, "  No compression detected, using standard Arrow reader\n");
+			}
+		}
+		else if (arrow_fdw_gpu_decompression_enabled)
+		{
+			fprintf(stderr, "INFO: GPU reading enabled but no columns to read\n");
+		}
+#endif /* OLD GPU decompression code */
 
 /*
  * parquetReadOneRowGroup - interface to C-portion

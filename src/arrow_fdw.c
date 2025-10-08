@@ -236,6 +236,7 @@ static shmem_startup_hook_type shmem_startup_next = NULL;
 static arrowMetadataCacheHead *arrow_metadata_cache = NULL;
 static bool					arrow_fdw_enabled;	/* GUC */
 static bool					arrow_fdw_stats_hint_enabled;	/* GUC */
+bool						arrow_fdw_gpu_decompression_enabled = true;	/* GUC */
 static int					arrow_metadata_cache_size_kb;	/* GUC */
 
 /* ----------------------------------------------------------------
@@ -6634,6 +6635,17 @@ pgstrom_init_arrow_fdw(void)
 							 PGC_USERSET,
                              GUC_NOT_IN_SAMPLE,
                              NULL, NULL, NULL);
+	/*
+	 * Turn on/off GPU decompression for Parquet files
+	 */
+	DefineCustomBoolVariable("arrow_fdw.gpu_decompression_enabled",
+							 "Enables GPU-based decompression for Parquet files using nvComp",
+							 NULL,
+							 &arrow_fdw_gpu_decompression_enabled,
+							 true,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
 	/*
 	 * Configurations for arrow_fdw metadata cache
 	 */
