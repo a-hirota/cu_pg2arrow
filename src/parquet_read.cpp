@@ -28,8 +28,8 @@
 #include "arrow_defs.h"
 #include "parquet_gpu_decomp.h"
 
-/* Forward declaration for cuDF reader */
-extern "C" kern_data_store *parquetReadRowGroupCuDF(
+/* Forward declaration for cuDF reader (C++ linkage) */
+kern_data_store *parquetReadRowGroupCuDF(
 	const char *filename,
 	int row_group_index,
 	const std::vector<int> &column_indices,

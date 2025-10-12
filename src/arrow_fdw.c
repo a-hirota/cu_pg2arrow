@@ -4366,6 +4366,10 @@ pg_timestamp_arrow_ref(kern_data_store *kds,
 	size_t		length = cmeta->values_length;
 	Timestamp	ts;
 
+	elog(LOG, "[TIMESTAMP DEBUG] index=%zu, length=%zu, sizeof(uint64)=%zu, check=%zu, unit=%d, attname=%s, values_offset=%zu, field_index=%d",
+		 index, length, sizeof(uint64), sizeof(uint64) * index, cmeta->attopts.timestamp.unit,
+		 cmeta->attname, (size_t)cmeta->values_offset, cmeta->field_index);
+
 	switch (cmeta->attopts.timestamp.unit)
 	{
 		case ArrowTimeUnit__Second:
