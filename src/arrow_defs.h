@@ -928,6 +928,7 @@ parquetReadOneRowGroup(const char *filename,
 					   void *(*malloc_callback)(void *malloc_private,
 												size_t malloc_size),
 					   void *malloc_private,
+					   uint32_t *p_nrowgroups_cudf_read,
 					   const char **p_error_message);
 
 /* Parquet metadata statistics gathering */

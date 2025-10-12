@@ -3877,6 +3877,7 @@ parquetFillupRowGroup(Relation relation,
 	kds = parquetReadOneRowGroup(rb_state->af_state->filename,
 								 kds_head,
 								 __parquetFillupAllocBuffer, chunk_buffer,
+								 NULL,  /* p_nrowgroups_cudf_read */
 								 &error_message);
 	if (!kds)
 		elog(ERROR, "Unable to load row-group %d of the parquet file '%s': %s",
@@ -5281,6 +5282,7 @@ ArrowShutdownForeignScan(ForeignScanState *node)
 void
 pgstromArrowFdwExplain(ArrowFdwState *arrow_state,
 					   Relation frel,
+					   pgstromSharedState *ps_state,
 					   ExplainState *es,
 					   List *dcontext)
 {
@@ -5331,9 +5333,21 @@ pgstromArrowFdwExplain(ArrowFdwState *arrow_state,
 			pfree(temp);
 		}
 		if (es->analyze)
-			appendStringInfo(&buf, "  [loaded: %u, skipped: %u]",
+		{
+			uint64_t	nrowgroups_cudf = 0;
+
+			appendStringInfo(&buf, "  [loaded: %u, skipped: %u",
 							 pg_atomic_read_u32(arrow_state->rbatch_nload),
 							 pg_atomic_read_u32(arrow_state->rbatch_nskip));
+			/* Add cuDF decompression count if available */
+			if (ps_state)
+			{
+				nrowgroups_cudf = pg_atomic_read_u64(&ps_state->nrowgroups_cudf_read);
+				if (nrowgroups_cudf > 0)
+					appendStringInfo(&buf, ", decompressed by gpu: %lu", nrowgroups_cudf);
+			}
+			appendStringInfoChar(&buf, ']');
+		}
 		ExplainPropertyText("Stats-Hint", buf.data, es);
 	}
 
@@ -5445,7 +5459,7 @@ ArrowExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	dcontext = set_deparse_context_plan(es->deparse_cxt,
 										node->ss.ps.plan,
 										NULL);
-	pgstromArrowFdwExplain(node->fdw_state, frel, es, dcontext);
+	pgstromArrowFdwExplain(node->fdw_state, frel, NULL, es, dcontext);
 }
 
 /*
@@ -6779,8 +6793,8 @@ pgstrom_init_arrow_fdw(void)
 	/*
 	 * Turn on/off GPU decompression for Parquet files
 	 */
-	DefineCustomBoolVariable("arrow_fdw.gpu_decompression_enabled",
-							 "Enables GPU-based decompression for Parquet files using nvComp",
+	DefineCustomBoolVariable("pg_strom.gpu_decompression_enabled",
+							 "Enables GPU-based decompression for Parquet files using cuDF",
 							 NULL,
 							 &arrow_fdw_gpu_decompression_enabled,
 							 true,

@@ -1008,6 +1008,8 @@ __updateStatsXpuCommand(pgstromTaskState *pts, const XpuCommand *xcmd)
 								xcmd->u.results.npages_direct_read);
 		pg_atomic_fetch_add_u64(&ps_state->npages_vfs_read,
 								xcmd->u.results.npages_vfs_read);
+		pg_atomic_fetch_add_u64(&ps_state->nrowgroups_cudf_read,
+								xcmd->u.results.nrowgroups_cudf_read);
 		pg_atomic_fetch_add_u64(&ps_state->source_ntuples_raw,
 								xcmd->u.results.nitems_raw);
 		pg_atomic_fetch_add_u64(&ps_state->source_ntuples_in,
@@ -2469,6 +2471,12 @@ pgstromGpuDirectExplain(pgstromTaskState *pts,
 		appendStringInfo(&buf, "%sntuples=%lu",
 						 (buf.len > base ? ", " : "; "),
 						 count);
+		/* Show cuDF usage if enabled and Parquet files were read */
+		count = pg_atomic_read_u64(&ps_state->nrowgroups_cudf_read);
+		if (count > 0)
+			appendStringInfo(&buf, "%scuDF=%lu",
+							 (buf.len > base ? ", " : "; "),
+							 count);
 	}
 	if (!pgstrom_regression_test_mode)
 		ExplainPropertyText("Scan-Engine", buf.data, es);
@@ -2992,6 +3000,7 @@ pgstromExplainTaskState(CustomScanState *node,
 	{
 		pgstromArrowFdwExplain(pts->arrow_state,
 							   pts->css.ss.ss_currentRelation,
+							   ps_state,
 							   es, dcontext);
 		pgstromGpuDirectExplain(pts, es, dcontext);
 	}

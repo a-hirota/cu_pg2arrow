@@ -3539,7 +3539,8 @@ static gpuMemChunk *
 gpuservLoadKdsParquet(gpuClient *gclient,
 					  kern_data_store *kds_head,
 					  const char *pathname,
-					  uint32_t *p_npages_vfs_read)
+					  uint32_t *p_npages_vfs_read,
+					  uint32_t *p_nrowgroups_cudf_read)
 {
 	gpuMemChunk *m_chunk;
 	kern_data_store *kds;
@@ -3549,6 +3550,7 @@ gpuservLoadKdsParquet(gpuClient *gclient,
 								 kds_head,
 								 __loadKdsParquetMallocCallback,
 								 &m_chunk,
+								 p_nrowgroups_cudf_read,
 								 &error_message);
 	if (!kds)
 	{
@@ -4094,6 +4096,7 @@ gpuservHandleGpuTaskExec(gpuContext *gcontext,
 	uint32_t		num_inner_rels = 0;
 	uint32_t		npages_direct_read = 0;
 	uint32_t		npages_vfs_read = 0;
+	uint32_t		nrowgroups_cudf_read = 0;
 	kern_exec_results *kern_stats;			/* for statistics */
 	void		   *gc_lmap = NULL;
 	gpuMemChunk	   *t_chunk = NULL;			/* for kgtask */
@@ -4207,7 +4210,8 @@ gpuservHandleGpuTaskExec(gpuContext *gcontext,
 		s_chunk = gpuservLoadKdsParquet(gclient,
 										kds_src,
 										kds_src_pathname,
-										&npages_vfs_read);
+										&npages_vfs_read,
+										&nrowgroups_cudf_read);
 		if (!s_chunk)
 			return;
 		m_kds_src = s_chunk->m_devptr;
@@ -4276,6 +4280,7 @@ gpuservHandleGpuTaskExec(gpuContext *gcontext,
 	kern_stats->num_rels = num_inner_rels;
 	kern_stats->npages_direct_read = npages_direct_read;
 	kern_stats->npages_vfs_read = npages_vfs_read;
+	kern_stats->nrowgroups_cudf_read = nrowgroups_cudf_read;
 
 	/* kick GPU kernel function */
 	if (__gpuservLaunchGpuTaskExecKernel(gcontext,

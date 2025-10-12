@@ -394,6 +394,7 @@ typedef struct
 	pg_atomic_uint64	npages_direct_read;	/* read by GPU-Direct Storage */
 	pg_atomic_uint64	npages_vfs_read;	/* read from VFS layer */
 	pg_atomic_uint64	npages_buffer_read;	/* read from PG buffer */
+	pg_atomic_uint64	nrowgroups_cudf_read; /* # of Parquet row groups read by cuDF */
 	pg_atomic_uint64	source_ntuples_raw;	/* # of raw tuples in the base relation */
 	pg_atomic_uint64	source_ntuples_in;	/* # of tuples survived from WHERE-quals */
 	pg_atomic_uint64	result_ntuples;		/* # of tuples returned from xPU */
@@ -1001,6 +1002,7 @@ extern void		pgstromArrowFdwAttachDSM(ArrowFdwState *arrow_state,
 extern void		pgstromArrowFdwShutdown(ArrowFdwState *arrow_state);
 extern void		pgstromArrowFdwExplain(ArrowFdwState *arrow_state,
 									   Relation frel,
+									   pgstromSharedState *ps_state,
 									   ExplainState *es,
 									   List *dcontext);
 extern bool		kds_arrow_fetch_tuple(TupleTableSlot *slot,

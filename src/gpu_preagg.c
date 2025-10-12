@@ -2057,6 +2057,9 @@ try_add_final_groupby_paths(xpugroupby_build_path_context *con, Path *part_path)
 										   con->num_groups);
 		dummy_path = pgstrom_create_dummy_path(con->root, agg_path);
 
+		elog(LOG, "GpuPreAgg + CPU HashAgg path: part_cost=%.2f agg_cost=%.2f total_cost=%.2f rows=%.0f",
+			 part_path->total_cost, agg_path->total_cost, dummy_path->total_cost, dummy_path->rows);
+
 		add_path(con->group_rel, dummy_path);
 	}
 	else if (parse->distinctClause)
@@ -2136,7 +2139,33 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 		pp_info->xpu_task_flags |= (DEVTASK__PREAGG | DEVTASK__PINNED_ROW_RESULTS);
 	pp_info->sibling_param_id = con->sibling_param_id;
 	/* TODO: more precise cost factors */
-	pp_info->final_nrows = con->num_groups;
+
+	/* Adjust num_groups if it seems overestimated due to combinatorial explosion */
+	double original_num_groups = con->num_groups;
+	double adjusted_num_groups = con->num_groups;
+	double selectivity_ratio = adjusted_num_groups / input_nrows;
+
+	/* Heuristic: If estimated groups are too close to input rows (>10%),
+	 * it's likely an overestimate. PostgreSQL's estimate_num_groups() multiplies
+	 * n_distinct values which causes combinatorial explosion. */
+	if (selectivity_ratio > 0.1 && adjusted_num_groups > 10000)
+	{
+		/* Apply reduction factor based on magnitude */
+		if (adjusted_num_groups > 1000000)
+			adjusted_num_groups /= 100.0;
+		else if (adjusted_num_groups > 100000)
+			adjusted_num_groups /= 10.0;
+		else if (adjusted_num_groups > 10000)
+			adjusted_num_groups /= 3.0;
+
+		elog(LOG, "GpuPreAgg: Adjusted num_groups from %.0f to %.0f (ratio=%.3f, input_nrows=%.0f)",
+			 original_num_groups, adjusted_num_groups, selectivity_ratio, input_nrows);
+
+		/* Update context for downstream CPU HashAgg cost estimation */
+		con->num_groups = adjusted_num_groups;
+	}
+
+	pp_info->final_nrows = adjusted_num_groups;
 
 	/* No tuples shall be generated until child JOIN/SCAN path completion */
 	pp_info->startup_cost = (pp_info->startup_cost +
@@ -2152,7 +2181,7 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 							  target_partial->cost.startup) * xpu_ratio;
 	/* Cost for DMA receive (xPU --> Host) */
 	pp_info->run_cost = (con->target_partial->cost.per_tuple +
-						 xpu_tuple_cost) * con->num_groups / pp_info->parallel_divisor;
+						 xpu_tuple_cost) * adjusted_num_groups / pp_info->parallel_divisor;
 	pp_info->final_cost = 0.0;
 
 	cpath->path.pathtype         = T_CustomScan;
@@ -2162,7 +2191,7 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	cpath->path.parallel_aware   = con->try_parallel;
 	cpath->path.parallel_safe    = con->input_rel->consider_parallel;
 	cpath->path.parallel_workers = pp_info->parallel_nworkers;
-	cpath->path.rows             = con->num_groups;
+	cpath->path.rows             = adjusted_num_groups;
 	cpath->path.startup_cost     = pp_info->startup_cost;
 	cpath->path.total_cost       = (pp_info->startup_cost +
 									pp_info->run_cost +
@@ -2172,6 +2201,10 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	cpath->custom_paths          = con->inner_paths_list;
 	cpath->custom_private        = list_make3(pp_info, NULL, NULL);
 	cpath->methods               = xpu_cpath_methods;
+
+	elog(LOG, "GpuPreAgg path created: startup_cost=%.2f total_cost=%.2f rows=%.0f (original_groups=%.0f) input_nrows=%.0f",
+		 cpath->path.startup_cost, cpath->path.total_cost, cpath->path.rows, original_num_groups, PP_INFO_NUM_ROWS(pp_info));
+
 	return cpath;
 }
 

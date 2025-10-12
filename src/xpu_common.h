@@ -2776,6 +2776,7 @@ typedef struct {
 	/* statistics */
 	uint32_t	npages_direct_read;	/* # of pages read by GPU-Direct Storage */
 	uint32_t	npages_vfs_read;	/* # of pages read by VFS (fallback) */
+	uint32_t	nrowgroups_cudf_read; /* # of Parquet row groups decompressed by cuDF */
 	uint32_t	nitems_raw;		/* # of visible rows kept in the relation */
 	uint32_t	nitems_in;		/* # of result rows in depth-0 after WHERE-clause */
 	uint32_t	nitems_out;		/* # of result rows in final depth before host quals */
