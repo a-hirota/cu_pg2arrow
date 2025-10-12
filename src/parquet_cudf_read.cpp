@@ -139,11 +139,6 @@ parquetReadRowGroupCuDF(const char *filename,
 
 			auto cmeta = &kds->colmeta[col_idx];
 
-			fprintf(stderr, "[cuDF DEBUG] Column k=%d, field_idx=%d, col_idx=%d, attname=%s, data_size=%zu, offsets_size=%zu, num_rows=%ld\n",
-					k, field_idx, col_idx,
-					kds_head->colmeta[col_idx].attname,
-					col.data_size, col.offsets_size, num_rows);
-
 			/* Copy null bitmap from GPU */
 			if (col.null_mask && col.null_mask_size > 0) {
 				cmeta->nullmap_offset = curr_pos;
@@ -216,10 +211,6 @@ parquetReadRowGroupCuDF(const char *filename,
 						return NULL;
 					}
 					curr_pos += ARROW_ALIGN(col.data_size);
-					fprintf(stderr, "[cuDF DEBUG] Fixed-width column %s: values_offset=%zu, values_length=%zu, expected_size=%zu\n",
-							kds_head->colmeta[col_idx].attname,
-							cmeta->values_offset, cmeta->values_length,
-							(size_t)(num_rows * 8));
 				} else {
 					cmeta->values_offset = 0;
 					cmeta->values_length = 0;
@@ -234,8 +225,6 @@ parquetReadRowGroupCuDF(const char *filename,
 		/* Cleanup cuDF table */
 		pgstrom_cudf_free_table_wrapper(table);
 
-		fprintf(stderr, "[cuDF] Returning KDS: length=%zu, nitems=%ld, usage=%zu\n",
-				kds->length, num_rows, kds->usage);
 		return kds;
 	}
 	catch (const std::exception &e) {

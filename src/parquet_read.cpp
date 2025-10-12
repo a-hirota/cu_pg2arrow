@@ -953,3 +953,391 @@ parquetReadOneRowGroup(const char *filename,
 	}
 	return kds;
 }
+
+/*
+ * ParquetColumnStats
+ *
+ * Structure to hold aggregated statistics from Parquet metadata
+ * across all row groups in all files for a single column.
+ */
+struct ParquetColumnStats
+{
+	int64_t		total_rows;			/* Total number of rows across all files/row-groups */
+	int64_t		null_count;			/* Total number of NULL values */
+	bool		has_min_max;		/* True if min/max are available */
+	parquet::Type::type physical_type;	/* Parquet physical type */
+
+	/* Serialized min/max values (size depends on type) */
+	std::vector<uint8_t> min_value;
+	std::vector<uint8_t> max_value;
+
+	/* Average width estimate for variable-length types */
+	int32_t		avg_width;
+
+	ParquetColumnStats()
+		: total_rows(0), null_count(0), has_min_max(false),
+		  physical_type(parquet::Type::BOOLEAN), avg_width(0)
+	{
+	}
+};
+
+/*
+ * __gatherColumnStatistics
+ *
+ * Helper function to extract statistics for a single column from
+ * a single Parquet file's metadata, accumulating into the stats object.
+ */
+static bool
+__gatherColumnStatistics(const std::shared_ptr<parquet::FileMetaData> &file_metadata,
+						 int column_index,
+						 ParquetColumnStats *stats)
+{
+	int num_row_groups = file_metadata->num_row_groups();
+
+	for (int rg_idx = 0; rg_idx < num_row_groups; rg_idx++)
+	{
+		auto rg_metadata = file_metadata->RowGroup(rg_idx);
+
+		/* Validate column index */
+		if (column_index >= rg_metadata->num_columns())
+		{
+			__Elog("column index %d out of range (max %d)",
+				   column_index, rg_metadata->num_columns());
+			return false;
+		}
+
+		auto col_chunk = rg_metadata->ColumnChunk(column_index);
+		stats->total_rows += rg_metadata->num_rows();
+
+		/* Check if statistics are available */
+		if (!col_chunk->is_stats_set())
+			continue;
+
+		auto col_stats = col_chunk->statistics();
+		if (!col_stats)
+			continue;
+
+		/* Accumulate null count */
+		stats->null_count += col_stats->null_count();
+
+		/* Get physical type (should be same across all row groups) */
+		/* Note: Physical type is available from schema descriptor, not ColumnChunkMetaData */
+		/* For now, we'll determine it from the statistics type later */
+
+		/* Accumulate min/max if available */
+		if (col_stats->HasMinMax())
+		{
+			if (!stats->has_min_max)
+			{
+				/* First row group with min/max - initialize */
+				stats->has_min_max = true;
+				stats->min_value = std::vector<uint8_t>(
+					col_stats->EncodeMin().begin(),
+					col_stats->EncodeMin().end());
+				stats->max_value = std::vector<uint8_t>(
+					col_stats->EncodeMax().begin(),
+					col_stats->EncodeMax().end());
+			}
+			else
+			{
+				/* Update min/max across row groups */
+				std::string encoded_min = col_stats->EncodeMin();
+				std::string encoded_max = col_stats->EncodeMax();
+
+				/* Compare and update min */
+				if (memcmp(encoded_min.data(), stats->min_value.data(),
+						   std::min(encoded_min.size(), stats->min_value.size())) < 0)
+				{
+					stats->min_value = std::vector<uint8_t>(
+						encoded_min.begin(), encoded_min.end());
+				}
+
+				/* Compare and update max */
+				if (memcmp(encoded_max.data(), stats->max_value.data(),
+						   std::min(encoded_max.size(), stats->max_value.size())) > 0)
+				{
+					stats->max_value = std::vector<uint8_t>(
+						encoded_max.begin(), encoded_max.end());
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+/*
+ * __parquetGatherMetadataStatistics
+ *
+ * Internal C++ implementation to gather statistics from Parquet metadata.
+ * Iterates through all files and all row groups to aggregate statistics
+ * for a single column without decompressing any data.
+ */
+static ParquetColumnStats *
+__parquetGatherMetadataStatistics(const char **filenames,
+								  int num_files,
+								  int column_index)
+{
+	ParquetColumnStats *stats = new(std::nothrow) ParquetColumnStats();
+	if (!stats)
+	{
+		__Elog("out of memory");
+		return NULL;
+	}
+
+	for (int file_idx = 0; file_idx < num_files; file_idx++)
+	{
+		const char *filename = filenames[file_idx];
+		struct stat stat_buf;
+		uint32_t hash, hindex;
+		parquetMetaDataCache *entry = nullptr;
+		std::shared_ptr<parquet::FileMetaData> metadata = nullptr;
+
+		/* Stat the file */
+		if (stat(filename, &stat_buf) != 0)
+		{
+			__Elog("failed on stat('%s'): %m", filename);
+			delete stats;
+			return NULL;
+		}
+
+		hash = __parquetLocalFileHash(stat_buf.st_dev, stat_buf.st_ino);
+		hindex = hash % PQ_HASH_NSLOTS;
+
+		/* Try to get from cache */
+		pq_hash_lock[hindex].lock();
+		__dlist_foreach(entry, &pq_hash_slot[hindex])
+		{
+			if (entry->stat_buf.st_dev == stat_buf.st_dev &&
+				entry->stat_buf.st_ino == stat_buf.st_ino)
+			{
+				if (entry->stat_buf.st_mtim.tv_sec == stat_buf.st_mtim.tv_sec &&
+					entry->stat_buf.st_mtim.tv_nsec == stat_buf.st_mtim.tv_nsec)
+				{
+					entry->refcnt++;
+					metadata = entry->metadata;
+					pq_hash_lock[hindex].unlock();
+					break;
+				}
+			}
+		}
+
+		/* Open file if not in cache */
+		if (!metadata)
+		{
+			pq_hash_lock[hindex].unlock();
+
+			try {
+				auto raw_reader = parquet::ParquetFileReader::OpenFile(
+					std::string(filename),
+					false,	/* memory_map */
+					parquet::default_reader_properties(),
+					nullptr);
+
+				if (!raw_reader)
+				{
+					__Elog("failed to open Parquet file '%s'", filename);
+					delete stats;
+					return NULL;
+				}
+
+				metadata = raw_reader->metadata();
+
+				/* Add to cache */
+				pq_hash_lock[hindex].lock();
+				entry = new(std::nothrow) parquetMetaDataCache(filename, &stat_buf, hash);
+				if (entry)
+				{
+					entry->metadata = metadata;
+					__dlist_push_tail(&pq_hash_slot[hindex], &entry->chain);
+				}
+				pq_hash_lock[hindex].unlock();
+			}
+			catch (const std::exception &e) {
+				__Elog("exception opening Parquet file '%s': %s", filename, e.what());
+				delete stats;
+				return NULL;
+			}
+		}
+
+		/* Gather statistics from this file */
+		if (!__gatherColumnStatistics(metadata, column_index, stats))
+		{
+			if (entry)
+				parquetPutMetaDataCache(entry);
+			delete stats;
+			return NULL;
+		}
+
+		if (entry)
+			parquetPutMetaDataCache(entry);
+	}
+
+	/* Estimate average width for variable-length types */
+	if (stats->physical_type == parquet::Type::BYTE_ARRAY ||
+		stats->physical_type == parquet::Type::FIXED_LEN_BYTE_ARRAY)
+	{
+		if (stats->has_min_max && stats->min_value.size() > 0 && stats->max_value.size() > 0)
+		{
+			/* Simple estimate: average of min and max lengths */
+			stats->avg_width = (stats->min_value.size() + stats->max_value.size()) / 2;
+		}
+		else
+		{
+			/* Default estimate for strings */
+			stats->avg_width = 32;
+		}
+	}
+	else
+	{
+		/* Fixed-size types */
+		switch (stats->physical_type)
+		{
+			case parquet::Type::BOOLEAN:
+				stats->avg_width = 1;
+				break;
+			case parquet::Type::INT32:
+			case parquet::Type::FLOAT:
+				stats->avg_width = 4;
+				break;
+			case parquet::Type::INT64:
+			case parquet::Type::DOUBLE:
+				stats->avg_width = 8;
+				break;
+			case parquet::Type::INT96:
+				stats->avg_width = 12;
+				break;
+			default:
+				stats->avg_width = 8;
+				break;
+		}
+	}
+
+	return stats;
+}
+
+/*
+ * parquetGatherMetadataStatistics - C interface
+ *
+ * Gathers statistics for a single column from Parquet file metadata
+ * across multiple files without decompressing data.
+ *
+ * Returns a ParquetColumnStats structure or NULL on error.
+ * Caller must call parquetFreeColumnStats() to free the result.
+ */
+extern "C" void *
+parquetGatherMetadataStatistics(const char **filenames,
+							   int num_files,
+							   int column_index,
+							   const char **p_error_message)
+{
+	ParquetColumnStats *stats = NULL;
+
+	*__private_error_message = '\0';
+	try {
+		stats = __parquetGatherMetadataStatistics(filenames,
+												  num_files,
+												  column_index);
+	}
+	catch (const std::exception &e) {
+		snprintf(__private_error_message,
+				 sizeof(__private_error_message),
+				 "[exception] %s", e.what());
+	}
+
+	/* error reporting */
+	if (p_error_message)
+	{
+		if (stats)
+			*p_error_message = NULL;	/* no error status */
+		else if (*__private_error_message == '\0')
+			*p_error_message = "unknown internal error";
+		else
+			*p_error_message = __private_error_message;
+	}
+
+	return (void *)stats;
+}
+
+/*
+ * parquetFreeColumnStats - C interface
+ *
+ * Frees a ParquetColumnStats structure allocated by
+ * parquetGatherMetadataStatistics().
+ */
+extern "C" void
+parquetFreeColumnStats(void *stats_ptr)
+{
+	if (stats_ptr)
+		delete ((ParquetColumnStats *)stats_ptr);
+}
+
+/*
+ * Accessor functions for ParquetColumnStats (C interface)
+ * These allow C code to extract fields from the C++ structure.
+ */
+extern "C" int64_t
+parquetColumnStatsTotalRows(void *stats_ptr)
+{
+	if (!stats_ptr)
+		return 0;
+	return ((ParquetColumnStats *)stats_ptr)->total_rows;
+}
+
+extern "C" int64_t
+parquetColumnStatsNullCount(void *stats_ptr)
+{
+	if (!stats_ptr)
+		return 0;
+	return ((ParquetColumnStats *)stats_ptr)->null_count;
+}
+
+extern "C" bool
+parquetColumnStatsHasMinMax(void *stats_ptr)
+{
+	if (!stats_ptr)
+		return false;
+	return ((ParquetColumnStats *)stats_ptr)->has_min_max;
+}
+
+extern "C" int
+parquetColumnStatsPhysicalType(void *stats_ptr)
+{
+	if (!stats_ptr)
+		return 0;
+	return (int)((ParquetColumnStats *)stats_ptr)->physical_type;
+}
+
+extern "C" const uint8_t *
+parquetColumnStatsMinValue(void *stats_ptr, size_t *p_size)
+{
+	if (!stats_ptr)
+	{
+		*p_size = 0;
+		return NULL;
+	}
+	auto stats = (ParquetColumnStats *)stats_ptr;
+	*p_size = stats->min_value.size();
+	return stats->min_value.data();
+}
+
+extern "C" const uint8_t *
+parquetColumnStatsMaxValue(void *stats_ptr, size_t *p_size)
+{
+	if (!stats_ptr)
+	{
+		*p_size = 0;
+		return NULL;
+	}
+	auto stats = (ParquetColumnStats *)stats_ptr;
+	*p_size = stats->max_value.size();
+	return stats->max_value.data();
+}
+
+extern "C" int32_t
+parquetColumnStatsAvgWidth(void *stats_ptr)
+{
+	if (!stats_ptr)
+		return 0;
+	return ((ParquetColumnStats *)stats_ptr)->avg_width;
+}

@@ -930,6 +930,37 @@ parquetReadOneRowGroup(const char *filename,
 					   void *malloc_private,
 					   const char **p_error_message);
 
+/* Parquet metadata statistics gathering */
+__EXTERN void *
+parquetGatherMetadataStatistics(const char **filenames,
+							   int num_files,
+							   int column_index,
+							   const char **p_error_message);
+
+__EXTERN void
+parquetFreeColumnStats(void *stats_ptr);
+
+__EXTERN int64_t
+parquetColumnStatsTotalRows(void *stats_ptr);
+
+__EXTERN int64_t
+parquetColumnStatsNullCount(void *stats_ptr);
+
+__EXTERN bool
+parquetColumnStatsHasMinMax(void *stats_ptr);
+
+__EXTERN int
+parquetColumnStatsPhysicalType(void *stats_ptr);
+
+__EXTERN const uint8_t *
+parquetColumnStatsMinValue(void *stats_ptr, size_t *p_size);
+
+__EXTERN const uint8_t *
+parquetColumnStatsMaxValue(void *stats_ptr, size_t *p_size);
+
+__EXTERN int32_t
+parquetColumnStatsAvgWidth(void *stats_ptr);
+
 /* GPU decompression control variable */
 __EXTERN bool arrow_fdw_gpu_decompression_enabled;
 
