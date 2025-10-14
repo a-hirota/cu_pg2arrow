@@ -2308,8 +2308,6 @@ __buildXpuPreAggCustomPath(xpugroupby_build_path_context *con)
 	cpath->custom_private        = list_make3(pp_info, NULL, NULL);
 	cpath->methods               = xpu_cpath_methods;
 
-	elog(LOG, "GpuPreAgg path created: startup_cost=%.2f total_cost=%.2f rows=%.0f (original_groups=%.0f) input_nrows=%.0f",
-		 cpath->path.startup_cost, cpath->path.total_cost, cpath->path.rows, original_num_groups, PP_INFO_NUM_ROWS(pp_info));
 
 	return cpath;
 }
