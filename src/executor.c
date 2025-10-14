@@ -2471,13 +2471,8 @@ pgstromGpuDirectExplain(pgstromTaskState *pts,
 		appendStringInfo(&buf, "%sntuples=%lu",
 						 (buf.len > base ? ", " : "; "),
 						 count);
-		/* Show cuDF usage if enabled and Parquet files were read */
-		count = pg_atomic_read_u64(&ps_state->nrowgroups_cudf_read);
-		if (count > 0)
-			appendStringInfo(&buf, "%scuDF=%lu",
-							 (buf.len > base ? ", " : "; "),
-							 count);
 	}
+	/* cuDF usage is already shown in Stats-Hint, no need to duplicate here */
 	if (!pgstrom_regression_test_mode)
 		ExplainPropertyText("Scan-Engine", buf.data, es);
 	pfree(buf.data);
